@@ -25,6 +25,7 @@ import os
 import sqlite3
 import sys
 import time
+import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime
@@ -33,6 +34,7 @@ from typing import TYPE_CHECKING, Any
 
 from dotenv import load_dotenv  # noqa: F401  (re-exported via _load_dotenv)
 from rich.console import Console
+from rich.text import Text
 
 from tool_eval_bench.adapters.measurement import HTTPMeasurementClient
 from tool_eval_bench.adapters.wire_format import resolve_wire_format as _resolve_wire_format
@@ -52,6 +54,7 @@ from tool_eval_bench.application.run_config import (
     resume_mismatches,
 )
 from tool_eval_bench.application.run_context import build_run_context, identify_backend
+from tool_eval_bench.application.run_queries import invocation_session
 from tool_eval_bench.application.service import BenchmarkService
 from tool_eval_bench.cli import model_probe as _model_probe
 from tool_eval_bench.cli.compare_report import (
@@ -97,6 +100,10 @@ from tool_eval_bench.cli.local_commands import handle_local_command as _handle_l
 from tool_eval_bench.cli.modes import any_plugin_selected as _any_plugin_selected
 from tool_eval_bench.cli.modes import mode_conflict as _mode_conflict
 from tool_eval_bench.cli.modes import sends_system_prompt as _sends_system_prompt
+from tool_eval_bench.cli.perf import (
+    PerfPassFailed,
+    _resolve_benchy_tokenizer,
+)
 from tool_eval_bench.cli.perf import (
     run_llama_benchy as _run_llama_benchy,
 )
@@ -175,6 +182,16 @@ from tool_eval_bench.domain.scenarios import (
     ScenarioResult,
     ScenarioStatus,
     scenario_report_metadata,
+)
+from tool_eval_bench.runner.perf_presets import (
+    DEFAULT_PERF_PRESET,
+    PerfPass,
+    PerfPlan,
+    depth0_speeds,
+    estimate_pass_seconds,
+    failed_cell_count,
+    format_duration,
+    plan_perf,
 )
 from tool_eval_bench.storage.reports import MarkdownReporter
 from tool_eval_bench.storage.reports.throughput import throughput_report
@@ -478,6 +495,10 @@ class _Target:
     wire_format: str
     extra_params: dict[str, Any]
     run_context: RunContext | None
+    #: What the throughput sweep ran, set by ``_run_throughput_mode``. Its
+    #: plan leaves out a skipped depth pass, so the stored config never claims
+    #: a grid that was not attempted.
+    perf_sweep: _PerfSweep | None = None
 
 
 def _benchy_extra_args(args: argparse.Namespace) -> list[str] | None:
@@ -502,31 +523,258 @@ def _stored_tokenizer(tokenizer: str | None) -> str | None:
     return tokenizer
 
 
+def _perf_plan(target: _Target) -> PerfPlan:
+    """Resolve ``--perf-preset`` and any explicit workload flags into passes.
+
+    The served window comes from the run context; ``long`` drops the depths
+    that do not fit it. The plan is a pure function of the target, so the run
+    and the stored config always agree.
+    """
+    args = target.args
+    run_context = getattr(target, "run_context", None)
+    window = run_context.max_model_len if run_context is not None else None
+    return plan_perf(
+        getattr(args, "perf_preset", DEFAULT_PERF_PRESET),
+        pp=args.pp,
+        tg=args.tg,
+        runs=args.benchy_runs,
+        depths=None if args.depth is None else _parse_int_list(args.depth),
+        concurrency=None if args.concurrency is None else _parse_int_list(args.concurrency),
+        context_window=window if type(window) is int and window > 0 else None,
+    )
+
+
 def _throughput_config(target: _Target) -> dict[str, Any]:
     """The stored config of a throughput run that no scored run carries.
 
     The workload fields keep different sweeps out of one fingerprint cohort.
     ``--benchy-args`` is stored with credentials stripped, because it can
     carry ``--api-key``.
+
+    ``perf_preset`` is stored but not fingerprinted: the concrete grid already
+    is, and a short-preset run must keep the fingerprint it had before presets
+    existed. It reads ``custom`` when explicit flags changed the preset's grid.
+    ``passes`` appears only when the sweep ran more than one llama-benchy
+    invocation, because ``depths`` and ``concurrency`` alone would describe a
+    full cross product that never ran.
     """
     from tool_eval_bench.runner.llama_benchy import redact_arguments
 
     args = target.args
-    return {
+    plan = target.perf_sweep.plan if target.perf_sweep is not None else _perf_plan(target)
+    config: dict[str, Any] = {
         "model": target.model,
         "backend": target.backend,
         "base_url": target.base_url,
         "mode": "perf-only",
-        "pp": args.pp,
-        "tg": args.tg,
-        "depths": _parse_int_list(args.depth),
-        "concurrency": _parse_int_list(args.concurrency),
-        "runs": args.benchy_runs,
+        "pp": plan.pp,
+        "tg": plan.tg,
+        "depths": plan.depths,
+        "concurrency": plan.concurrency,
+        "runs": plan.runs,
         "latency_mode": args.benchy_latency_mode,
         # The tokenizer builds the prompts and counts their tokens.
         "tokenizer": _stored_tokenizer(getattr(args, "tokenizer", None)),
         "benchy_args": redact_arguments(_benchy_extra_args(args) or []),
+        "perf_preset": plan.stored_preset,
     }
+    if len(plan.passes) > 1:
+        config["passes"] = _stored_passes(plan)
+    return config
+
+
+def _stored_passes(plan: PerfPlan) -> list[dict[str, Any]] | None:
+    """The ``passes`` a run config records, or None for a single-pass sweep."""
+    if len(plan.passes) < 2:
+        return None
+    return [perf_pass.to_config() for perf_pass in plan.passes]
+
+
+def _depth_list(depths: tuple[int, ...]) -> str:
+    """``depth 65,536`` or ``depths 65,536 and 131,072``."""
+    labels = [f"{depth:,}" for depth in depths]
+    if len(labels) == 1:
+        return f"depth {labels[0]}"
+    return f"depths {', '.join(labels[:-1])} and {labels[-1]}"
+
+
+def _announce_perf_plan(console: Console, plan: PerfPlan) -> None:
+    """Warn about cells the served window cannot hold, or that it could not check."""
+    if not plan.request_fits:
+        console.print(
+            f"  [yellow]⚠ pp {plan.pp:,} plus tg {plan.tg:,} does not fit the "
+            f"{plan.context_window:,}-token context window, so even depth-0 cells will fail.[/]"
+        )
+    if plan.preset != "long":
+        return
+    if plan.context_window is None:
+        console.print(
+            "  [yellow]⚠ The served context window is unknown, so the depth pass keeps "
+            f"every depth up to {max(plan.depths):,}. A depth that does not fit will fail.[/]"
+        )
+    elif plan.dropped_depths:
+        console.print(
+            f"  [dim]Skipping {_depth_list(plan.dropped_depths)} in the depth pass: depth plus "
+            f"pp and tg does not fit the {plan.context_window:,}-token context window.[/]"
+        )
+
+
+def _print_pass_estimate(
+    console: Console, plan: PerfPlan, perf_pass: PerfPass, samples: list[ThroughputSample]
+) -> None:
+    """Print a rough runtime estimate for *perf_pass* from the depth-0 speeds so far."""
+    speeds = depth0_speeds(samples)
+    if speeds is None:
+        console.print(
+            "  [dim]No single-stream depth-0 result, so no runtime estimate for the depth pass.[/]"
+        )
+        return
+    pp_tps, tg_tps = speeds
+    seconds = estimate_pass_seconds(
+        perf_pass, pp=plan.pp, tg=plan.tg, runs=plan.runs, pp_tps=pp_tps, tg_tps=tg_tps
+    )
+    console.print(
+        f"  [bold]⏱ Depth pass estimate: at least {format_duration(seconds)}.[/] "
+        f"[dim]{len(perf_pass.depths)} depths x {plan.runs + 1} runs each, the discarded "
+        f"warm-up included, at the depth-0 speeds of {pp_tps:,.0f} pp t/s and "
+        f"{tg_tps:,.1f} tg t/s. Both slow down as depth grows, so expect longer.[/]"
+    )
+
+
+def _unfinished_pass_samples(plan: PerfPlan, perf_pass: PerfPass) -> list[ThroughputSample]:
+    """One failed sample per cell of a pass that stopped without results.
+
+    The error names the cell and is fixed text rather than llama-benchy's,
+    because a failed cell's error is shown in reports and the exception text
+    can quote the server URL.
+    """
+    from tool_eval_bench.runner.throughput import ThroughputSample
+
+    return [
+        ThroughputSample(
+            pp_tokens=plan.pp,
+            tg_tokens=plan.tg,
+            depth=depth,
+            concurrency=level,
+            requested_pp=plan.pp,
+            requested_depth=depth,
+            calibration_confidence="llama-benchy",
+            error=(
+                f"pp{plan.pp} tg{plan.tg} @ d{depth} c{level}: not measured, "
+                "llama-benchy stopped before this cell finished"
+            ),
+        )
+        for depth in perf_pass.depths
+        for level in perf_pass.concurrency
+    ]
+
+
+@dataclass(frozen=True)
+class _PerfSweep:
+    """What :func:`_run_perf_plan` measured.
+
+    ``plan`` holds only the passes that ran, the one that failed included.
+    ``incomplete`` means a planned pass was skipped, failed, or interrupted;
+    ``interrupted`` means Ctrl+C stopped a later pass.
+    """
+
+    samples: list[ThroughputSample]
+    plan: PerfPlan
+    incomplete: bool = False
+    interrupted: bool = False
+
+    @property
+    def failed_cells(self) -> int:
+        return failed_cell_count(self.samples)
+
+
+def _perf_notice(console: Console, markup: str) -> None:
+    """Print a throughput warning, or log it under ``--json`` so stderr carries it.
+
+    A ``HeadlessConsole`` drops every print, and these warnings change what
+    the stored run means. ``json_logging`` turns the log record into a
+    ``log`` event with URLs redacted.
+    """
+    if isinstance(console, HeadlessConsole):
+        logger.warning("%s", " ".join(Text.from_markup(markup).plain.split()))
+    else:
+        console.print(markup)
+
+
+def _run_perf_plan(target: _Target, plan: PerfPlan) -> _PerfSweep:
+    """Run every pass of *plan* and return their samples as one list.
+
+    The depth pass is skipped when the first pass produced nothing usable: a
+    server that failed every depth-0 cell will not survive 128K of context.
+    A first pass that stops without results ends the CLI, as a single-pass
+    sweep always has. A later pass that stops keeps what came before: its
+    cells are counted as failed and the sweep is marked incomplete.
+    """
+    args, console = target.args, target.console
+    _announce_perf_plan(console, plan)
+    tokenizer = getattr(args, "tokenizer", None)
+    if len(plan.passes) > 1:
+        # Resolved once, so the tokenizer line is printed once, not per pass.
+        tokenizer = _resolve_benchy_tokenizer(
+            console, target.model, target.display_name, target.base_url, tokenizer
+        )
+    samples: list[ThroughputSample] = []
+    for index, perf_pass in enumerate(plan.passes):
+        if index > 0:
+            if not any(not sample.error for sample in samples):
+                _perf_notice(
+                    console,
+                    "  [yellow]Skipping the depth pass: the first pass has no successful cell.[/]",
+                )
+                return _PerfSweep(samples, plan.first_passes(index), incomplete=True)
+            _print_pass_estimate(console, plan, perf_pass, samples)
+        try:
+            samples.extend(
+                _run_llama_benchy(
+                    console,
+                    target.model,
+                    target.display_name,
+                    target.base_url,
+                    target.api_key,
+                    pp=[plan.pp],
+                    tg=[plan.tg],
+                    depths=list(perf_pass.depths),
+                    concurrency_levels=list(perf_pass.concurrency),
+                    runs=plan.runs,
+                    latency_mode=args.benchy_latency_mode,
+                    skip_coherence=True,
+                    extra_args=_benchy_extra_args(args),
+                    # llama-benchy always warms up, as llama-bench does: its global
+                    # warm-up requests plus a discarded first run of every cell. Its
+                    # --no-warmup drops both, so each cell's first measured run would
+                    # be cold. tool-eval-bench's --no-warmup covers only its own.
+                    skip_warmup=False,
+                    tokenizer=tokenizer,
+                    backend=target.backend,
+                    enable_prefix_caching=perf_pass.prefix_caching,
+                    title=f"pass {index + 1}/{len(plan.passes)}" if len(plan.passes) > 1 else None,
+                )
+            )
+        except PerfPassFailed as failure:
+            if index == 0:
+                report_run_failed(console, failure.markup)
+                sys.exit(1)
+            unfinished = _unfinished_pass_samples(plan, perf_pass)
+            # Ctrl+C is reported once the earlier passes are saved.
+            reason = "" if failure.interrupted else f"{failure.markup.strip()}\n"
+            _perf_notice(
+                console,
+                f"{reason}  [yellow]⚠ Pass {index + 1} stopped. Keeping the earlier passes "
+                f"and counting its {len(unfinished)} cell(s) as failed.[/]",
+            )
+            samples.extend(unfinished)
+            return _PerfSweep(
+                samples,
+                plan.first_passes(index + 1),
+                incomplete=True,
+                interrupted=failure.interrupted,
+            )
+    return _PerfSweep(samples, plan)
 
 
 def _run_throughput_mode(target: _Target) -> tuple[list, bool]:
@@ -535,35 +783,47 @@ def _run_throughput_mode(target: _Target) -> tuple[list, bool]:
     Returns the samples and whether the CLI is finished; ``--perf-only`` writes
     its own report and stops, while ``--perf`` hands its samples to whatever
     runs next. ``_run_cli`` persists them itself when no scored run follows.
+    A multi-pass preset still yields one sample list and one stored run.
+    Ctrl+C during a later pass saves the earlier passes on their own and
+    exits 1, whatever mode was meant to follow.
+
+    The sweep's stored preset, passes, and completeness are left on ``args``
+    for ``ScoredRun.from_args``, so a scored run records the plan that ran.
     """
-    args, console = target.args, target.console
+    args = target.args
     if not (args.perf or args.perf_only):
         return [], False
 
-    throughput_samples = _run_llama_benchy(
-        console,
-        target.model,
-        target.display_name,
-        target.base_url,
-        target.api_key,
-        pp=[args.pp],
-        tg=[args.tg],
-        depths=_parse_int_list(args.depth),
-        concurrency_levels=_parse_int_list(args.concurrency),
-        runs=args.benchy_runs,
-        latency_mode=args.benchy_latency_mode,
-        skip_coherence=True,
-        extra_args=_benchy_extra_args(args),
-        # llama-benchy always warms up, as llama-bench does: its global
-        # warm-up requests plus a discarded first run of every cell. Its
-        # --no-warmup drops both, so each cell's first measured run would be
-        # cold. tool-eval-bench's --no-warmup covers only its own warm-up.
-        skip_warmup=False,
-        tokenizer=getattr(args, "tokenizer", None),
-        backend=target.backend,
-    )
+    sweep = _run_perf_plan(target, _perf_plan(target))
+    target.perf_sweep = sweep
+    args._perf_preset = sweep.plan.stored_preset
+    args._perf_passes = _stored_passes(sweep.plan)
+    args._perf_incomplete = sweep.incomplete
+    throughput_samples = sweep.samples
+
+    if sweep.interrupted:
+        _save_throughput(target, throughput_samples)
+        skipped = (
+            " The tool-call scenarios were not run."
+            if not args.perf_only and _scored_run_follows(args)
+            else ""
+        )
+        report_run_failed(
+            target.console,
+            f"[bold red]Interrupted.[/] The finished throughput passes are saved.{skipped}",
+        )
+        sys.exit(1)
 
     if not args.perf_only:
+        if sweep.failed_cells and _scored_run_follows(args):
+            # The scored run keeps the status its scenarios earn; the sweep's
+            # failure is recorded beside it, so say so here.
+            state = ", the sweep is incomplete" if sweep.incomplete else ""
+            _perf_notice(
+                target.console,
+                f"  [yellow]⚠ Throughput: {sweep.failed_cells} cell(s) failed{state}. The scored "
+                "run records this under its throughput results.[/]",
+            )
         # Failed cells too: the stored row counts them, and every report and
         # display of the samples drops them itself.
         return throughput_samples, False
@@ -580,13 +840,21 @@ def _save_throughput(target: _Target, throughput_samples: list[ThroughputSample]
     ``--skip-tool-eval``). Both store the same config, so the same measurement
     lands in the same fingerprint cohort. The caller decides when a failed
     cell ends the CLI; see :func:`_exit_if_throughput_failed`.
+
+    ``samples`` and ``successful`` count result rows, of which a prefix-cached
+    cell has two; ``failed`` counts grid cells, as every message does.
+    ``incomplete`` is present, and True, when a planned pass did not finish.
     """
     args, console = target.args, target.console
-    failed_count = sum(bool(sample.error) for sample in throughput_samples)
-    successful_count = len(throughput_samples) - failed_count
+    sweep = target.perf_sweep
+    failed_count = failed_cell_count(throughput_samples)
+    incomplete = sweep is not None and sweep.incomplete
+    successful_count = sum(not sample.error for sample in throughput_samples)
     scores: dict[str, Any] = {"samples": len(throughput_samples)}
     if failed_count:
         scores.update({"successful": successful_count, "failed": failed_count})
+    if incomplete:
+        scores["incomplete"] = True
     # Failed cells stay a count: their error text can quote the server URL.
     scores["results"] = [sample.to_result() for sample in throughput_samples if not sample.error]
     run_context = target.run_context
@@ -594,7 +862,8 @@ def _save_throughput(target: _Target, throughput_samples: list[ThroughputSample]
         run_type="perf",
         config=_throughput_config(target),
         scores=scores,
-        status="failed" if failed_count else "completed",
+        status="failed" if failed_count or incomplete else "completed",
+        unfingerprinted=("perf_preset",),
     )
     finalized = finalize_mode_run(
         run,
@@ -878,6 +1147,11 @@ def _build_run_context(
         if run_context.engine_version:
             engine_str += f" {run_context.engine_version}"
         console.print(f"  [dim]🔍 Engine: {engine_str}[/]")
+    session_id = getattr(args, "_session_id", None)
+    if run_context is not None and session_id:
+        # Every mode persists ``run_context.to_dict()``, so this one field is
+        # what tags each stored row of the invocation with its session.
+        run_context = replace(run_context, session_id=session_id)
     return run_context
 
 
@@ -887,7 +1161,15 @@ def _run_spec_bench_mode(target: _Target) -> bool:
     model, base_url, api_key = target.model, target.base_url, target.api_key
     display_name = target.display_name
     if args.spec_bench:
-        spec_depths = _parse_int_list(args.depth)
+        # Spec-bench reads --pp, --tg, and --depth but ignores --perf-preset:
+        # unset values keep the short grid it has always used.
+        workload = plan_perf(
+            "short",
+            pp=args.pp,
+            tg=args.tg,
+            depths=None if args.depth is None else _parse_int_list(args.depth),
+        )
+        spec_depths = workload.depths
         spec_prompts = [p.strip() for p in args.spec_prompts.split(",") if p.strip()]
         custom_prompts = load_spec_prompt_file(args.spec_prompt_file)
         # A file with no explicit selection runs every prompt in it.
@@ -899,8 +1181,8 @@ def _run_spec_bench_mode(target: _Target) -> bool:
             display_name,
             base_url,
             api_key,
-            pp=args.pp,
-            tg=args.tg,
+            pp=workload.pp,
+            tg=workload.tg,
             depths=spec_depths,
             spec_method=args.spec_method,
             baseline_tg_tps=args.baseline_tgs,
@@ -1019,10 +1301,22 @@ def _run_cli(args: argparse.Namespace, parser: argparse.ArgumentParser, console:
         # stdout carries only the result envelope; see cli.headless.
         console = HeadlessConsole()
     _validate_explicit_scenarios(args, parser)
+    args._session_id = uuid.uuid4().hex
     if args.resume and not args.probe:
         # _plan_resume reads the run again later; checking now keeps a bad
         # target from costing the preflight, warm-up, and any perf sweep.
-        _load_resumable(args, console)
+        prev_run, _ = _load_resumable(args, console)
+        args._session_id = _resumed_session_id(prev_run) or args._session_id
+    # The RunContext carries the id into each row's metadata. The scope covers
+    # a run whose context could not be built, which stores no metadata.
+    with invocation_session(args._session_id):
+        _run_session(args, parser, console)
+
+
+def _run_session(
+    args: argparse.Namespace, parser: argparse.ArgumentParser, console: Console
+) -> None:
+    """Run the benchmark modes of one invocation; ``_run_cli`` sets up its session."""
     endpoint = _resolve_endpoint(args, parser, console)
     if args.probe:
         _run_probe_mode(args, console, endpoint)
@@ -1695,6 +1989,26 @@ def _load_resumable(
         )
         sys.exit(1)
     return prev_run, prev_checkpoints
+
+
+def _resumed_session_id(prev_run: Mapping[str, Any]) -> str | None:
+    """The session a ``--resume`` invocation joins, or None to start a new one.
+
+    A resume finishes the interrupted invocation's scored run under its
+    original run ID, so it keeps that invocation's session id too. The plugin,
+    standalone perf, and other rows written before the interruption then share
+    a session with the completed scored run, and a card of that session shows
+    them together. Throughput from ``--perf`` alongside scenarios is the
+    exception: those samples ride in memory until the scored run is saved, so
+    an interruption loses them. Any rows the resume invocation writes join the
+    same session. A run stored before session ids existed has none, so the
+    resume starts a fresh session.
+
+    The column wins over the metadata copy: a write without a session, such as
+    a Python API resume, replaces the metadata but keeps the column.
+    """
+    session_id = prev_run.get("session_id") or (prev_run.get("metadata") or {}).get("session_id")
+    return session_id if isinstance(session_id, str) and session_id else None
 
 
 def _plan_resume(target: _Target, pressure: _PressureFill | None) -> None:

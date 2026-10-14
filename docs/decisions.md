@@ -45,3 +45,36 @@ the two entry points would disagree. The token closes both paths for every bind 
 The UI stops only runs it launched and resumes only `interrupted` runs whose stored config it
 can rebuild, refusing the rest with a pointer to `tool-eval-bench resume`. Revisit if the UI
 gains multi-user access, which would need real accounts instead of one shared token.
+
+## Grouping runs by CLI invocation
+
+Every row one CLI invocation stores carries an explicit `session_id`, generated once per
+invocation and stored in its own indexed column. `card` reads a session back by that id.
+Matching rows by model and a time window was rejected: two invocations against one model
+minutes apart would merge, and a long scored run would split from the perf sweep before it.
+The cost is a schema migration and rows from before it that no card can group.
+
+A resume adopts the session of the run it resumes, so the completed scored run stays with the
+rows its interrupted invocation wrote. Revisit if a card needs to combine separate invocations
+on purpose, which would call for a user-named grouping rather than an implicit one.
+
+## Rendering card PNGs
+
+`card` writes an SVG with the standard library and rasterises it to PNG only through the
+optional `card` extra, `resvg-py`. The base install gains no native dependency, and `resvg-py`
+ships abi3 wheels for Linux, macOS, and Windows, so the extra needs no system libraries. Without
+it, `card --png` still writes the SVG and exits 1 with an install hint.
+
+The PNG renders with bundled subsets of Inter and JetBrains Mono under the SIL OFL, with
+system fonts disabled, so the same session gives the same PNG on every machine. The subsets
+add about 620 KB to the wheel. resvg ignores `font-feature-settings`, so the Inter subsets
+point the digits at their tabular glyphs. `fonts/SOURCES.txt` records how to regenerate them.
+
+CairoSVG was rejected because it needs the system cairo library, which a plain `pip` or
+`uv tool` install cannot provide. A headless browser was rejected as far too heavy for one
+image. Embedding the fonts in the SVG was rejected because it would add hundreds of
+kilobytes to every SVG card. The SVG names the fonts in a fallback stack instead, so a
+browser rendering stays close without them.
+
+Revisit if `resvg-py` stops publishing wheels for a supported platform, if a pure-Python
+renderer can produce the same output, or if the card needs text features resvg lacks.

@@ -31,6 +31,9 @@ uv tool install 'tool-eval-bench[web] @ git+https://github.com/SeraphimSerapis/t
 
 # Several extras at once: comma-separate them inside the brackets
 uv tool install 'tool-eval-bench[perf,web] @ git+https://github.com/SeraphimSerapis/tool-eval-bench.git'
+
+# With PNG export for results cards (resvg-py)
+uv tool install 'tool-eval-bench[card] @ git+https://github.com/SeraphimSerapis/tool-eval-bench.git'
 ```
 
 Also available via [Docker](https://github.com/SeraphimSerapis/tool-eval-bench/blob/main/docs/docker.md) if you would rather not have a local
@@ -267,6 +270,7 @@ design: [docs/methodology.md](https://github.com/SeraphimSerapis/tool-eval-bench
 | `decision-live` | Monitor a decision model with live canary probes |
 | `compare` | Compare stored runs or Markdown reports |
 | `history`, `leaderboard`, `export` | Inspect or export persisted results |
+| `card` | Render a shareable results card from stored runs |
 | `resume` | Continue an incomplete run |
 | `serve` | Launch the local web UI for browsing, live runs, comparisons, and launching benchmarks; open the sign-in link it prints ([details](https://github.com/SeraphimSerapis/tool-eval-bench/blob/main/docs/cli-reference.md#web-ui-serve)) |
 
@@ -365,6 +369,44 @@ never turn it on. Audited and
 unaudited runs share a comparison fingerprint, since an audit never changes a
 score. Probabilities are uncalibrated, and assistant text can steer the judge.
 See [answer audit limits and API configuration](https://github.com/SeraphimSerapis/tool-eval-bench/blob/main/docs/decision-models.md#answer-audits).
+
+### Share a results card
+
+`tool-eval-bench card` turns one benchmark session into a single image you can
+post: decode and prefill speed, time to first token across context depths,
+concurrency scaling, needle retrieval, tool-calling quality, and accuracy
+benchmarks. Every run one invocation stores shares a session, so run
+everything at once and then render the card:
+
+```bash
+tool-eval-bench --seed 42 --perf --perf-preset long --needle --gsm8k --mmlu --ifeval
+tool-eval-bench card --png --hardware "RTX 5090 32GB"
+```
+
+The card is written to `runs/cards/<model>-<YYYYMMDD>-<fingerprint>.svg`, using
+the model name in lowercase with punctuation turned into dashes, the date of the
+newest run on the card, and the first
+8 characters of the configuration fingerprint. Add `--png` for a `.png` beside
+it. PNG export needs the `card` extra, installed as shown under
+[Install](#install) or with
+`pip install 'tool-eval-bench[card] @ git+https://github.com/SeraphimSerapis/tool-eval-bench.git'`.
+Without it the SVG is still written and the command exits 1. A section the
+session did not measure is marked as such, and the command prints the flags
+that would fill it.
+
+`card SESSION` renders an older session, `--model M` picks the latest session
+for one model, and `--run RUN_ID` (repeatable) builds a card from specific
+runs, including runs stored before sessions existed. A unique session prefix of
+6 or more characters is enough. `--layout landscape`
+suits a link preview; portrait is the default. Hardware is never detected, so
+pass `--hardware` if you want it on the image.
+
+The card carries no hostname, server URL, session or run id, label, tokenizer
+path, or system prompt, and neither does its filename. A model served from a
+local path is named by its served model id instead of the directory. The short
+fingerprint names a configuration: the scored run's when the card has one,
+otherwise the throughput run's, otherwise the newest run on the card. Readers
+can use it to tell whether two cards measured the same setup.
 
 ## Programmatic API
 

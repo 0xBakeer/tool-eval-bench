@@ -73,6 +73,8 @@ class _Inputs:
     settings: RunSettings
     scenarios: list[ScenarioDefinition]
     scenario_packs: list[dict[str, Any]] | None
+    perf_preset: str | None = None
+    perf_passes: list[dict[str, Any]] | None = None
 
 
 class Presence(Enum):
@@ -435,6 +437,30 @@ RUN_CONFIG_FIELDS: tuple[ConfigField, ...] = (
         identifies_model=False,
         resume=ResumeCheck(Absent.UNSET),
     ),
+    # The --perf-preset whose samples ride in this scored run's scores, for
+    # readers such as the model card. Written only when --perf samples are
+    # attached, so absence means no samples or a run from before presets.
+    # "custom" means overrides changed the preset's grid. Throughput never
+    # affects the score, so the preset stays out of the fingerprint and the
+    # resume check.
+    ConfigField(
+        "perf_preset",
+        lambda i: i.perf_preset,
+        Presence.WHEN_NOT_NONE,
+        Fingerprint.EXCLUDE,
+        identifies_model=False,
+        resume=None,
+    ),
+    # The passes of a multi-pass --perf plan, the same list a --perf-only row
+    # stores as "passes". Absent for a single-pass plan and without samples.
+    ConfigField(
+        "perf_passes",
+        lambda i: i.perf_passes,
+        Presence.WHEN_NOT_NONE,
+        Fingerprint.EXCLUDE,
+        identifies_model=False,
+        resume=None,
+    ),
 )
 
 #: Keys the leaderboard drops to rank different models under the same
@@ -480,14 +506,19 @@ def build_run_config(
     scenarios: list[ScenarioDefinition],
     metadata: dict[str, Any],
     scenario_packs: list[dict[str, Any]] | None = None,
+    perf_preset: str | None = None,
+    perf_passes: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Build the persisted config and its deterministic comparison fingerprint.
 
     The fingerprint decides which runs the leaderboard groups together, so the
     key set and value shapes here are a stored contract: changing them
-    re-cohorts every historical run.
+    re-cohorts every historical run. ``perf_preset`` names the preset of the
+    ``--perf`` samples attached to the run, or None when there are none, and
+    ``perf_passes`` lists the passes of a multi-pass plan. Neither enters the
+    fingerprint or the cohort.
     """
-    inputs = _Inputs(settings, scenarios, scenario_packs)
+    inputs = _Inputs(settings, scenarios, scenario_packs, perf_preset, perf_passes)
     config: dict[str, Any] = {}
     fingerprint_config: dict[str, Any] = {}
     for field in RUN_CONFIG_FIELDS:
