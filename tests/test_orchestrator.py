@@ -1577,6 +1577,39 @@ async def test_run_all_scenarios_forwards_the_override(concurrency: int) -> None
     assert all("OVERRIDE-MARKER" in message["content"] for message in systems)
 
 
+@pytest.mark.asyncio
+async def test_rejected_json_schema_falls_back_to_json_object() -> None:
+    """DeepSeek rejects json_schema but accepts json_object: grade the model anyway."""
+    rejected = ChatCompletionResult(
+        content="[server error 400] This response_format type is unavailable now",
+        transport_error_status=400,
+    )
+    adapter = MockAdapter(
+        [
+            {"tool_calls": [{"name": "get_weather", "arguments": {"city": "Berlin"}}]},
+            rejected,
+            {"content": '{"ok": true}'},
+            {"content": "unused"},
+        ]
+    )
+    scenario = ScenarioDefinition(
+        **{
+            **MOCK_SCENARIO.__dict__,
+            "response_format_override": {"type": "json_schema", "json_schema": {"schema": {}}},
+        }
+    )
+
+    result = await run_scenario(
+        adapter, model="test", base_url="http://x", api_key=None, scenario=scenario
+    )
+
+    sent = [p["response_format"] for p in adapter.captured_payloads]
+    assert sent[1]["type"] == "json_schema"
+    assert sent[2] == {"type": "json_object"}
+    assert result.status == ScenarioStatus.PASS
+    assert "response_format_fallback=json_schema -> json_object (HTTP 400)" in result.raw_log
+
+
 @pytest.mark.parametrize("warmup_fails", [False, True], ids=["warm", "warmup-fails"])
 @pytest.mark.asyncio
 async def test_context_pressure_warms_the_shared_prefix_unscored(warmup_fails: bool) -> None:
