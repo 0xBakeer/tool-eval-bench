@@ -2,7 +2,7 @@
 
 A tool-calling quality benchmark for LLMs in agentic workflows, built for
 self-hosted serving stacks: **vLLM**, **SGLang**, **LiteLLM**, **llama.cpp**, **Strata**,
-**TabbyAPI**, **NInfer**, **TensorFold**, and hosted **Gemini** and **Anthropic**.
+**TabbyAPI**, **NInfer**, **TensorFold**, **TandemLLM**, and hosted **Gemini** and **Anthropic**.
 
 Each scenario observes one assistant conversation with mock tools. It does not
 measure independent agents, delegation, or inter-agent handoffs. Localization
